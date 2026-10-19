@@ -1,6 +1,7 @@
 {
-    "work_duration": 15,
-    "break_duration": 30,
+    "work_duration": 7200,
+    "break_duration": 900,
     "video_choice": "random",
-    "sound_choice": "random"
+    "sound_choice": "random",
+    "sleep_reset_threshold": 3600
 }

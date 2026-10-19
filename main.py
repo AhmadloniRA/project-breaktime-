@@ -4,6 +4,8 @@ import signal
 import random
 import math
 import json
+import time
+import ctypes
 
 # ==========================================
 # KONFIGURASI SCALING DPI WINDOWS
@@ -41,10 +43,11 @@ if sys.stderr is None:
 COLOR_YELLOW = "#ffe88b"
 
 DEFAULT_CONFIG = {
-    "work_duration": 15,      # Default: 2 Jam (detik)
-    "break_duration": 30,      # Default: 5 Menit (detik)
+    "work_duration": 7200,      # Default: 2 Jam (detik)
+    "break_duration": 900,      # Default: 15 Menit (detik)
     "video_choice": "random",   # "random" atau nama file spesifik di assets/videos/
-    "sound_choice": "random"    # "random" atau nama file spesifik di assets/sounds/
+    "sound_choice": "random",    # "random" atau nama file spesifik di assets/sounds/
+    "sleep_reset_threshold": 3600  # Default: Reset timer jika sleep / idle >= 1 Jam (detik)
 }
 
 
@@ -201,6 +204,43 @@ def resolve_sound_path(choice=None):
                 return os.path.join(assets_dir, f)
 
     return None
+
+
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint),
+        ("dwTime", ctypes.c_uint)
+    ]
+
+
+def get_idle_duration():
+    """Mengembalikan durasi komputer idle (tidak ada input mouse/keyboard) dalam detik di Windows."""
+    if sys.platform != "win32":
+        return 0.0
+    try:
+        lii = LASTINPUTINFO()
+        lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+            current_tick = ctypes.windll.kernel32.GetTickCount()
+            elapsed_ms = (current_tick - lii.dwTime) & 0xFFFFFFFF
+            return elapsed_ms / 1000.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def format_duration_human(seconds):
+    """Mengubah detik ke teks yang mudah dibaca (contoh: '45 detik', '30 menit', '1.5 jam')."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} detik"
+    mins = seconds // 60
+    if mins < 60:
+        return f"{mins} menit"
+    hours = mins / 60
+    if hours.is_integer():
+        return f"{int(hours)} jam"
+    return f"{hours:.1f} jam"
 
 
 def create_tray_icon():
@@ -637,6 +677,10 @@ class AppController:
         self.setup_tray_menu()
         self.tray_icon.show()
 
+        # Pelacakan Waktu Sleep & Idle
+        self.last_tick_time = time.time()
+        self.was_idle_over_threshold = False
+
         # Timer Detik
         self.clock_timer = QTimer()
         self.clock_timer.timeout.connect(self.tick)
@@ -655,7 +699,7 @@ class AppController:
             QSystemTrayIcon.MessageIcon.Information,
             3000
         )
-        print(f"[BreakTime] Aktif di background. Durasi kerja: {self.current_work_time}s, Durasi istirahat: {self.config.get('break_duration', 30)}s.")
+        print(f"[BreakTime] Aktif di background. Durasi kerja: {self.current_work_time}s, Durasi istirahat: {self.config.get('break_duration', 900)}s.")
         print("[BreakTime] Layar penuh akan otomatis muncul saat hitungan mundur selesai (atau klik tray menu 'Mulai Istirahat Sekarang').")
 
     def setup_tray_menu(self):
@@ -685,6 +729,7 @@ class AppController:
 
         self.menu_work = self.settings_menu.addMenu("⏱️ Waktu Kerja")
         self.menu_break = self.settings_menu.addMenu("☕ Waktu Istirahat")
+        self.menu_sleep_reset = self.settings_menu.addMenu("💤 Reset Otomatis (Sleep / Idle)")
         self.settings_menu.addSeparator()
         self.menu_video = self.settings_menu.addMenu("🎬 Video Background")
         self.menu_sound = self.settings_menu.addMenu("🎵 Lagu Relaksasi")
@@ -739,16 +784,31 @@ class AppController:
             (30, "30 Detik (Testing)"),
             (300, "5 Menit"),
             (600, "10 Menit"),
-            (900, "15 Menit")
+            (900, "15 Menit (Default)")
         ]
-        current_break = self.config.get("break_duration", 300)
+        current_break = self.config.get("break_duration", 900)
+        matched_break = False
 
         for sec, label in break_presets:
             act = self.menu_break.addAction(label)
             act.setCheckable(True)
             if current_break == sec:
                 act.setChecked(True)
+                matched_break = True
             act.triggered.connect(lambda checked, s=sec: self.set_break_duration(s))
+
+        self.menu_break.addSeparator()
+        if matched_break:
+            custom_break_label = "✏️ Kustom (Menit)..."
+        else:
+            custom_mins = current_break / 60
+            custom_break_label = f"✏️ Kustom ({custom_mins:g} Menit)"
+
+        act_custom_break = self.menu_break.addAction(custom_break_label)
+        act_custom_break.setCheckable(True)
+        if not matched_break:
+            act_custom_break.setChecked(True)
+        act_custom_break.triggered.connect(self.prompt_custom_break_duration)
 
         # 3. Sub-Menu Video Background
         self.menu_video.clear()
@@ -796,6 +856,39 @@ class AppController:
             act_none = self.menu_sound.addAction("(Folder assets/sounds/ kosong)")
             act_none.setEnabled(False)
 
+        # 5. Sub-Menu Reset Otomatis Sleep / Idle
+        self.menu_sleep_reset.clear()
+        sleep_presets = [
+            (15, "15 Detik (Testing)"),
+            (1800, "30 Menit"),
+            (3600, "1 Jam (Default)"),
+            (7200, "2 Jam"),
+            (0, "Nonaktif (Jangan Reset)")
+        ]
+        current_sleep = self.config.get("sleep_reset_threshold", 3600)
+        matched_sleep = False
+
+        for sec, label in sleep_presets:
+            act = self.menu_sleep_reset.addAction(label)
+            act.setCheckable(True)
+            if current_sleep == sec:
+                act.setChecked(True)
+                matched_sleep = True
+            act.triggered.connect(lambda checked, s=sec: self.set_sleep_reset_threshold(s))
+
+        self.menu_sleep_reset.addSeparator()
+        if matched_sleep:
+            custom_sleep_label = "✏️ Kustom (Menit)..."
+        else:
+            custom_mins = current_sleep / 60
+            custom_sleep_label = f"✏️ Kustom ({custom_mins:g} Menit)"
+
+        act_custom_sleep = self.menu_sleep_reset.addAction(custom_sleep_label)
+        act_custom_sleep.setCheckable(True)
+        if not matched_sleep:
+            act_custom_sleep.setChecked(True)
+        act_custom_sleep.triggered.connect(self.prompt_custom_sleep_reset_threshold)
+
     def set_work_duration(self, seconds):
         self.config["work_duration"] = int(seconds)
         save_config(self.config)
@@ -822,6 +915,20 @@ class AppController:
         save_config(self.config)
         self.update_settings_menu()
 
+    def prompt_custom_break_duration(self):
+        current_minutes = max(1, round(self.config.get("break_duration", 900) / 60))
+        minutes, ok = QInputDialog.getInt(
+            None,
+            "Kustom Waktu Istirahat",
+            "Masukkan durasi istirahat (menit):",
+            value=current_minutes,
+            min=1,
+            max=180,
+            step=1
+        )
+        if ok and minutes > 0:
+            self.set_break_duration(minutes * 60)
+
     def set_video_choice(self, choice):
         self.config["video_choice"] = choice
         save_config(self.config)
@@ -831,6 +938,48 @@ class AppController:
         self.config["sound_choice"] = choice
         save_config(self.config)
         self.update_settings_menu()
+
+    def set_sleep_reset_threshold(self, seconds):
+        self.config["sleep_reset_threshold"] = int(seconds)
+        save_config(self.config)
+        self.update_settings_menu()
+
+    def prompt_custom_sleep_reset_threshold(self):
+        current_minutes = max(1, round(self.config.get("sleep_reset_threshold", 3600) / 60))
+        minutes, ok = QInputDialog.getInt(
+            None,
+            "Kustom Batas Reset Sleep",
+            "Mereset timer jika sleep / tidak digunakan selama (menit):",
+            value=current_minutes,
+            min=1,
+            max=720,
+            step=1
+        )
+        if ok and minutes > 0:
+            self.set_sleep_reset_threshold(minutes * 60)
+
+    def reset_work_timer_from_sleep(self, elapsed_seconds=0, reason="sleep"):
+        """Mereset timer kerja ke awal setelah komputer sleep atau idle melampaui batas threshold."""
+        if self.state == "RESTING":
+            self.end_break()
+
+        self.state = "WORKING"
+        self.is_paused = False
+        self.action_pause.setText("⏸️ Pause Timer")
+        self.current_work_time = self.config.get("work_duration", 7200)
+        self.was_idle_over_threshold = False
+        self.update_tray_tooltip()
+
+        reason_text = "dalam mode sleep" if reason == "sleep" else "tidak digunakan (idle)"
+        dur_str = format_duration_human(elapsed_seconds)
+
+        self.tray_icon.showMessage(
+            "Timer Kerja Direset",
+            f"Komputer telah {reason_text} selama {dur_str}. Timer kerja otomatis direset ke awal ({self.format_time(self.current_work_time)}).",
+            QSystemTrayIcon.MessageIcon.Information,
+            4000
+        )
+        print(f"[BreakTime] Timer direset ke awal ({self.current_work_time}s) karena komputer {reason_text} ({dur_str}).")
 
     def toggle_pause(self):
         if self.state != "WORKING":
@@ -843,7 +992,11 @@ class AppController:
         self.update_tray_tooltip()
 
     def format_time(self, seconds):
-        mins, secs = divmod(int(seconds), 60)
+        total_seconds = int(seconds)
+        hours, remainder = divmod(total_seconds, 3600)
+        mins, secs = divmod(remainder, 60)
+        if hours > 0:
+            return f"{hours:02d}:{mins:02d}:{secs:02d}"
         return f"{mins:02d}:{secs:02d}"
 
     def update_tray_tooltip(self):
@@ -866,6 +1019,35 @@ class AppController:
         self.tray_icon.setToolTip(msg)
 
     def tick(self):
+        now = time.time()
+        threshold = self.config.get("sleep_reset_threshold", 3600)
+
+        # Cek jika fitur reset otomatis sleep/idle aktif (threshold > 0)
+        if threshold and threshold > 0:
+            # 1. Deteksi Laptop Bangun dari Sleep / Suspend / Hibernate
+            # Selama laptop sleep, thread QTimer berhenti berputar.
+            # Saat laptop dibuka kembali, selisih waktu (gap) time.time() akan melonjak besar.
+            if self.last_tick_time is not None:
+                gap = now - self.last_tick_time
+                if gap >= threshold:
+                    self.last_tick_time = now
+                    print(f"[BreakTime] Terdeteksi sistem bangun dari mode sleep ({int(gap)} detik).")
+                    self.reset_work_timer_from_sleep(gap, reason="sleep")
+                    return
+
+            # 2. Deteksi Komputer Idle (tidak ada interaksi mouse/keyboard > threshold)
+            idle_sec = get_idle_duration()
+            if idle_sec >= threshold:
+                self.was_idle_over_threshold = True
+            elif self.was_idle_over_threshold:
+                self.was_idle_over_threshold = False
+                self.last_tick_time = now
+                print(f"[BreakTime] Pengguna kembali aktif setelah idle ({int(threshold)} detik).")
+                self.reset_work_timer_from_sleep(threshold, reason="idle")
+                return
+
+        self.last_tick_time = now
+
         if self.state == "WORKING":
             if self.is_paused:
                 # Timer dijeda, tidak mengurangi countdown
@@ -906,7 +1088,7 @@ class AppController:
 
         # Siapkan Video Background & Durasi Istirahat
         video_path = resolve_video_path(self.config.get("video_choice", "random"))
-        break_duration = self.config.get("break_duration", 300)
+        break_duration = self.config.get("break_duration", 900)
 
         monitors = get_monitors()
         if not monitors:
