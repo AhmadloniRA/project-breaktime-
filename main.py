@@ -47,7 +47,8 @@ DEFAULT_CONFIG = {
     "break_duration": 900,      # Default: 15 Menit (detik)
     "video_choice": "random",   # "random" atau nama file spesifik di assets/videos/
     "sound_choice": "random",    # "random" atau nama file spesifik di assets/sounds/
-    "sleep_reset_threshold": 3600  # Default: Reset timer jika sleep / idle >= 1 Jam (detik)
+    "sleep_reset_threshold": 3600,  # Default: Reset timer jika sleep / idle >= 1 Jam (detik)
+    "keep_screen_awake_on_break": True  # Mencegah layar laptop mati/sleep saat istirahat berlangsung
 }
 
 
@@ -204,6 +205,38 @@ def resolve_sound_path(choice=None):
                 return os.path.join(assets_dir, f)
 
     return None
+
+
+# ==========================================
+# WINDOWS API: CEK IDLE & KONTROL POWER/LAYAR
+# ==========================================
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
+
+
+def set_screen_keep_awake(enable=True):
+    """
+    Jika enable=True: Mencegah layar laptop mati / standby / sleep di Windows selama break time.
+    Jika enable=False: Mengembalikan kontrol timeout layar ke pengaturan daya sistem Windows.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetThreadExecutionState.argtypes = [ctypes.c_uint32]
+        kernel32.SetThreadExecutionState.restype = ctypes.c_uint32
+
+        if enable:
+            kernel32.SetThreadExecutionState(
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+            )
+            print("[BreakTime] Layar dikunci agar tetap menyala selama istirahat (anti-sleep aktif).")
+        else:
+            kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+            print("[BreakTime] Istirahat selesai: Pengaturan layar dikembalikan ke pengaturan sistem.")
+    except Exception as e:
+        print(f"[BreakTime] Gagal mengatur execution state layar: {e}", file=sys.stderr)
 
 
 class LASTINPUTINFO(ctypes.Structure):
@@ -733,6 +766,10 @@ class AppController:
         self.settings_menu.addSeparator()
         self.menu_video = self.settings_menu.addMenu("🎬 Video Background")
         self.menu_sound = self.settings_menu.addMenu("🎵 Lagu Relaksasi")
+        self.settings_menu.addSeparator()
+        self.action_keep_screen_awake = self.settings_menu.addAction("🔆 Layar Tetap Menyala Saat Istirahat")
+        self.action_keep_screen_awake.setCheckable(True)
+        self.action_keep_screen_awake.triggered.connect(self.toggle_keep_screen_awake)
 
         self.update_settings_menu()
 
@@ -888,6 +925,18 @@ class AppController:
         if not matched_sleep:
             act_custom_sleep.setChecked(True)
         act_custom_sleep.triggered.connect(self.prompt_custom_sleep_reset_threshold)
+
+        # 6. Opsi Layar Tetap Menyala Saat Istirahat (Anti-Sleep)
+        keep_awake = self.config.get("keep_screen_awake_on_break", True)
+        self.action_keep_screen_awake.setChecked(keep_awake)
+
+    def toggle_keep_screen_awake(self):
+        new_val = not self.config.get("keep_screen_awake_on_break", True)
+        self.config["keep_screen_awake_on_break"] = new_val
+        save_config(self.config)
+        self.update_settings_menu()
+        if self.state == "RESTING":
+            set_screen_keep_awake(new_val)
 
     def set_work_duration(self, seconds):
         self.config["work_duration"] = int(seconds)
@@ -1060,6 +1109,15 @@ class AppController:
                 self.start_break()
 
         elif self.state == "RESTING":
+            # Jaga agar sinyal anti-sleep tetap aktif di Windows selama istirahat
+            if self.config.get("keep_screen_awake_on_break", True) and sys.platform == "win32":
+                try:
+                    ctypes.windll.kernel32.SetThreadExecutionState(
+                        ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+                    )
+                except Exception:
+                    pass
+
             finished_any = False
             for overlay in self.overlays:
                 if overlay.update_countdown():
@@ -1078,6 +1136,10 @@ class AppController:
         self.overlays.clear()
         self.keyboard_worker.reset_keys()
         self.update_tray_tooltip()
+
+        # Mencegah layar laptop mati / sleep selama break time berlangsung
+        if self.config.get("keep_screen_awake_on_break", True):
+            set_screen_keep_awake(True)
 
         # Putar Lagu Relaksasi
         sound_path = resolve_sound_path(self.config.get("sound_choice", "random"))
@@ -1122,6 +1184,9 @@ class AppController:
         if self.state != "RESTING":
             return
 
+        # Kembalikan pengaturan layar ke settingan default Windows
+        set_screen_keep_awake(False)
+
         # Hentikan Lagu Relaksasi
         if self.player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
             self.player.stop()
@@ -1146,6 +1211,8 @@ class AppController:
             self.update_tray_tooltip()
 
     def quit_app(self):
+        # Pastikan pengaturan layar dikembalikan sebelum keluar
+        set_screen_keep_awake(False)
         if self.player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
             self.player.stop()
         self.clock_timer.stop()

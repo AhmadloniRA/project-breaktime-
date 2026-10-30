@@ -3,5 +3,6 @@
     "break_duration": 900,
     "video_choice": "random",
     "sound_choice": "random",
-    "sleep_reset_threshold": 3600
+    "sleep_reset_threshold": 3600,
+    "keep_screen_awake_on_break": true
 }
